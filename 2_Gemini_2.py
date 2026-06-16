@@ -30,6 +30,32 @@ os.environ["USERPROFILE"] = model_dir
 
 CONFIG_FILE = "ocr_config.json"
 
+OCR_STATUS_DIRECT = "原始识别"
+OCR_STATUS_RETRY = "二次识别"
+OCR_STATUS_FILLED = "补值"
+OCR_STATUS_FAILED = "失败"
+
+DIGIT_CROP_REGIONS = [
+    ("数字区域-宽", (0.20, 0.20, 0.95, 0.72)),
+    ("数字区域-中", (0.25, 0.22, 0.95, 0.65)),
+    ("数字区域-紧", (0.30, 0.25, 0.92, 0.60)),
+]
+
+RETRY_PREPROCESS_METHODS = [
+    "original",
+    "enhanced",
+    "lcd_sharp",
+    "lcd_binary",
+    "lcd_dark",
+]
+
+RESULT_TIME_STEP_MINUTES = 10
+CHART_Y_MIN = 3.0
+CHART_Y_MIN_TOP = 3.6
+CHART_Y_MAX_LIMIT = 5.0
+CHART_Y_MAJOR_STEP = 0.2
+CHART_Y_MINOR_STEP = 0.1
+
 
 # --- 辅助函数 ---
 
@@ -41,7 +67,7 @@ def load_config():
                 return json.load(f)
     except:
         pass
-    return {"last_folder": ""}
+    return {"last_folder": "", "output_folder": ""}
 
 
 def save_config(config):
@@ -53,6 +79,41 @@ def save_config(config):
         print(f"保存配置文件失败: {e}")
 
 
+def make_result(result, methods=None, best_method="", status=OCR_STATUS_DIRECT, note="", score=0.0):
+    return {
+        "result": str(result),
+        "methods": methods or [],
+        "best_method": best_method,
+        "status": status,
+        "note": note,
+        "score": score
+    }
+
+
+def get_result_value(value):
+    if isinstance(value, dict):
+        return str(value.get("result", "0"))
+    return str(value)
+
+
+def get_result_status(value):
+    if isinstance(value, dict):
+        return value.get("status", OCR_STATUS_DIRECT)
+    return OCR_STATUS_DIRECT
+
+
+def get_result_note(value):
+    if isinstance(value, dict):
+        return value.get("note", "")
+    return ""
+
+
+def get_result_best_method(value):
+    if isinstance(value, dict):
+        return value.get("best_method", "")
+    return ""
+
+
 def read_image_cv2(path):
     """解决 Windows 下 opencv 不支持中文路径的问题"""
     try:
@@ -62,38 +123,153 @@ def read_image_cv2(path):
         return None
 
 
-def save_results_to_txt(results):
+def get_output_folder(output_folder):
+    """未选择结果目录时，默认保存到程序当前运行目录。"""
+    output_folder = (output_folder or "").strip()
+    if not output_folder:
+        output_folder = os.getcwd()
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+    return output_folder
+
+
+def save_results_to_txt(results, output_folder=None, timestamp=None):
     """将识别结果保存到txt文件"""
     try:
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        filename = f"{timestamp}_results.txt"
+        output_folder = get_output_folder(output_folder)
+        timestamp = timestamp or datetime.now().strftime("%Y%m%d%H%M%S")
+        filename = os.path.join(output_folder, f"{timestamp}_results.txt")
         with open(filename, 'w', encoding='utf-8', errors='ignore') as f:
-            for image_file, numbers in results.items():
+            for image_file, info in results.items():
                 f.write(f"{image_file}:\n")
-                f.write(f"{numbers}\n")
+                f.write(f"{get_result_value(info)}\n")
+                status = get_result_status(info)
+                note = get_result_note(info)
+                best_method = get_result_best_method(info)
+                if status != OCR_STATUS_DIRECT:
+                    f.write(f"标记: {status}\n")
+                if best_method:
+                    f.write(f"最佳方法: {best_method}\n")
+                if note:
+                    f.write(f"说明: {note}\n")
                 f.write("\n")
         return filename
     except Exception as e:
         raise Exception(f"保存结果文件失败: {str(e)}")
 
 
-def save_results_to_excel(results):
+def build_result_rows(results):
+    rows = []
+    for index, (img_name, info) in enumerate(results.items()):
+        value = get_result_value(info)
+        try:
+            num_val = float(value)
+        except:
+            num_val = value
+        rows.append({
+            "图片名称": img_name,
+            "时间(分钟)": index * RESULT_TIME_STEP_MINUTES,
+            "识别结果": num_val,
+            "标记": get_result_status(info),
+            "最佳方法": get_result_best_method(info),
+            "说明": get_result_note(info)
+        })
+    return rows
+
+
+def save_results_to_excel(results, output_folder=None, timestamp=None):
     """将识别结果保存为 Excel 文件"""
     try:
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        filename = f"{timestamp}_results.xlsx"
-        data = []
-        for img_name, value in results.items():
-            try:
-                num_val = float(value)
-            except:
-                num_val = value
-            data.append({"图片名称": img_name, "识别结果": num_val})
-        df = pd.DataFrame(data)
+        output_folder = get_output_folder(output_folder)
+        timestamp = timestamp or datetime.now().strftime("%Y%m%d%H%M%S")
+        filename = os.path.join(output_folder, f"{timestamp}_results.xlsx")
+        df = pd.DataFrame(build_result_rows(results))
         df.to_excel(filename, index=False)
         return filename
     except Exception as e:
         print(f"保存 Excel 失败: {str(e)}")
+        return None
+
+
+def get_chart_value(info):
+    if get_result_status(info) == OCR_STATUS_FAILED:
+        return np.nan
+    try:
+        return float(get_result_value(info))
+    except:
+        return np.nan
+
+
+def get_nice_chart_step(max_value):
+    for step in [10, 20, 50, 100, 200, 500, 1000]:
+        if max_value <= step * 4:
+            return step
+    return 2000
+
+
+def get_chart_y_max(y_values):
+    valid_values = [value for value in y_values if not np.isnan(value)]
+    if not valid_values:
+        return CHART_Y_MIN_TOP
+    data_max = max(valid_values)
+    padded_max = data_max + CHART_Y_MINOR_STEP / 2
+    rounded_max = np.ceil(padded_max / CHART_Y_MINOR_STEP) * CHART_Y_MINOR_STEP
+    return min(max(CHART_Y_MIN_TOP, rounded_max), CHART_Y_MAX_LIMIT)
+
+
+def save_results_chart(results, output_folder=None, timestamp=None):
+    """按图片顺序生成识别数值随时间变化的折线图。"""
+    try:
+        output_folder = get_output_folder(output_folder)
+        timestamp = timestamp or datetime.now().strftime("%Y%m%d%H%M%S")
+        filename = os.path.join(output_folder, f"{timestamp}_results_chart.png")
+
+        x_values = []
+        y_values = []
+        for index, info in enumerate(results.values()):
+            x_values.append(index)
+            y_values.append(get_chart_value(info))
+
+        if not x_values or np.all(np.isnan(y_values)):
+            return None
+
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.ticker import FormatStrFormatter, MultipleLocator
+
+        plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Arial Unicode MS", "DejaVu Sans"]
+        plt.rcParams["axes.unicode_minus"] = False
+
+        fig_width = min(max(10, len(x_values) * 0.025), 16)
+        fig, ax = plt.subplots(figsize=(fig_width, 5), dpi=160)
+        ax.plot(x_values, y_values, color="red", linewidth=2.2)
+        ax.set_xlabel("时间(10min)")
+        ax.set_ylabel("压强 (MPa)")
+
+        max_time_index = max(x_values) if x_values else 1
+        if max_time_index == 0:
+            max_time_index = 1
+        major_step = get_nice_chart_step(max_time_index)
+        y_axis_max = get_chart_y_max(y_values)
+        ax.set_xlim(0, max_time_index)
+        ax.set_ylim(CHART_Y_MIN, y_axis_max)
+        ax.xaxis.set_major_locator(MultipleLocator(major_step))
+        ax.xaxis.set_minor_locator(MultipleLocator(max(1, major_step / 2)))
+        ax.set_yticks(np.arange(CHART_Y_MIN, y_axis_max + 0.001, CHART_Y_MAJOR_STEP))
+        ax.set_yticks(np.arange(CHART_Y_MIN, y_axis_max + 0.001, CHART_Y_MINOR_STEP), minor=True)
+        ax.yaxis.set_major_formatter(FormatStrFormatter("%.3f"))
+        ax.grid(False)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_linewidth(1.2)
+        ax.spines["bottom"].set_linewidth(1.2)
+        fig.tight_layout()
+        fig.savefig(filename)
+        plt.close(fig)
+        return filename
+    except Exception as e:
+        print(f"保存趋势图失败: {str(e)}")
         return None
 
 
@@ -187,7 +363,49 @@ def preprocess_image_memory(img_array, method='enhanced'):
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         processed = clahe.apply(gray)
 
+    elif method == 'lcd_sharp':
+        blur = cv2.GaussianBlur(gray, (0, 0), 1.0)
+        processed = cv2.addWeighted(gray, 1.8, blur, -0.8, 0)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        processed = clahe.apply(processed)
+
+    elif method == 'lcd_binary':
+        blur = cv2.GaussianBlur(gray, (3, 3), 0)
+        processed = cv2.adaptiveThreshold(
+            blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 31, 5
+        )
+
+    elif method == 'lcd_dark':
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        boosted = clahe.apply(gray)
+        _, mask = cv2.threshold(boosted, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        kernel_v = np.ones((2, 1), np.uint8)
+        mask = cv2.dilate(mask, kernel_v, iterations=1)
+        processed = cv2.bitwise_not(mask)
+
     return cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
+
+
+def crop_image_region(img_array, region):
+    """按比例裁剪仪表数字显示区域，避免品牌、单位、条形刻度干扰 OCR。"""
+    height, width = img_array.shape[:2]
+    left, top, right, bottom = region
+    x1 = max(0, min(width - 1, int(width * left)))
+    y1 = max(0, min(height - 1, int(height * top)))
+    x2 = max(x1 + 1, min(width, int(width * right)))
+    y2 = max(y1 + 1, min(height, int(height * bottom)))
+    return img_array[y1:y2, x1:x2]
+
+
+def score_ocr_candidate(text, score):
+    final_score = score
+    if '.' in text:
+        final_score += 100
+        final_score += len(text) * 10
+    else:
+        final_score += len(text) * 0.5
+    return final_score
 
 
 def extract_numbers(text):
@@ -277,7 +495,7 @@ def ocr_image_with_stats(image_path, ocr, use_preprocessing=True):
     """主识别函数：并在内存中尝试多种方法，选取置信度最高的"""
     original_img = read_image_cv2(image_path)
     if original_img is None:
-        return {"result": "0", "methods": [], "best_method": "error"}
+        return make_result("0", methods=[], best_method="error", status=OCR_STATUS_FAILED, note="图片读取失败")
 
     methods_to_try = ['original']
     if use_preprocessing:
@@ -298,38 +516,133 @@ def ocr_image_with_stats(image_path, ocr, use_preprocessing=True):
             text, score = ocr_execute_memory(processed_img, ocr)
 
             if text:
-                final_score = score
-                # 【评分逻辑】优先选择带小数点的，优先选择更长的
-                if '.' in text:
-                    final_score += 100
-                    final_score += len(text) * 10
-                else:
-                    final_score += len(text) * 0.5
-
                 candidates.append({
                     "method": method,
                     "text": text,
-                    "score": final_score
+                    "score": score_ocr_candidate(text, score)
                 })
         except Exception:
             continue
 
-    if not candidates:
-        return {
-            "result": "0",
-            "methods": used_methods,
-            "best_method": "failed"
-        }
+    if candidates:
+        # 按分数从高到低排序
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        best = candidates[0]
+        return make_result(
+            best["text"],
+            methods=used_methods,
+            best_method=best["method"],
+            status=OCR_STATUS_DIRECT,
+            score=best["score"]
+        )
 
-    # 按分数从高到低排序
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    best = candidates[0]
+    retry_candidates = []
+    for region_name, region in DIGIT_CROP_REGIONS:
+        cropped_img = crop_image_region(original_img, region)
+        for method in RETRY_PREPROCESS_METHODS:
+            try:
+                if method == 'original':
+                    processed_img = cropped_img
+                else:
+                    processed_img = preprocess_image_memory(cropped_img, method)
 
-    return {
-        "result": best["text"],
-        "methods": used_methods,
-        "best_method": best["method"]
-    }
+                retry_method = f"{region_name}+{method}"
+                used_methods.append(retry_method)
+                text, score = ocr_execute_memory(processed_img, ocr)
+                if text:
+                    retry_candidates.append({
+                        "method": retry_method,
+                        "text": text,
+                        "score": score_ocr_candidate(text, score)
+                    })
+            except Exception:
+                continue
+
+    if retry_candidates:
+        retry_candidates.sort(key=lambda x: x["score"], reverse=True)
+        best = retry_candidates[0]
+        return make_result(
+            best["text"],
+            methods=used_methods,
+            best_method=best["method"],
+            status=OCR_STATUS_RETRY,
+            note="原图识别失败后，通过裁剪数字区域二次识别恢复",
+            score=best["score"]
+        )
+
+    return make_result("0", methods=used_methods, best_method="failed", status=OCR_STATUS_FAILED)
+
+
+def parse_float_result(info):
+    try:
+        value = get_result_value(info)
+        if value == "0":
+            return None
+        return float(value)
+    except:
+        return None
+
+
+def decimal_places(value_text):
+    value_text = str(value_text)
+    if "." not in value_text:
+        return 0
+    return len(value_text.split(".", 1)[1])
+
+
+def apply_interpolation_fill(results, ordered_files):
+    """对连续失败段做线性补值，并保留“补值”标记，便于 Excel 复核。"""
+    filled_count = 0
+    index = 0
+    total = len(ordered_files)
+
+    while index < total:
+        image_file = ordered_files[index]
+        if image_file not in results or get_result_value(results[image_file]) != "0":
+            index += 1
+            continue
+
+        block_start = index
+        while index < total and ordered_files[index] in results and get_result_value(results[ordered_files[index]]) == "0":
+            index += 1
+        block_end = index - 1
+
+        prev_index = block_start - 1
+        next_index = index
+        if prev_index < 0 or next_index >= total:
+            continue
+
+        prev_file = ordered_files[prev_index]
+        next_file = ordered_files[next_index]
+        prev_value = parse_float_result(results.get(prev_file))
+        next_value = parse_float_result(results.get(next_file))
+        if prev_value is None or next_value is None:
+            continue
+
+        block_size = block_end - block_start + 1
+        precision = max(
+            decimal_places(get_result_value(results[prev_file])),
+            decimal_places(get_result_value(results[next_file])),
+            3
+        )
+
+        for offset, fill_index in enumerate(range(block_start, block_end + 1), start=1):
+            ratio = offset / (block_size + 1)
+            filled_value = prev_value + (next_value - prev_value) * ratio
+            filled_text = f"{filled_value:.{precision}f}"
+            current_file = ordered_files[fill_index]
+            current_info = results.get(current_file, {})
+            current_methods = current_info.get("methods", []) if isinstance(current_info, dict) else []
+            results[current_file] = make_result(
+                filled_text,
+                methods=current_methods,
+                best_method="linear_interpolation",
+                status=OCR_STATUS_FILLED,
+                note=f"原图和二次识别均失败，按前后读数补值：{prev_file}={prev_value}，{next_file}={next_value}"
+            )
+            filled_count += 1
+
+    return filled_count
 
 
 # --- GUI 界面类 ---
@@ -357,6 +670,14 @@ class OCRGUI:
         self.folder_path = tk.StringVar(value=self.config.get("last_folder", ""))
         ttk.Entry(folder_frame, textvariable=self.folder_path, width=50).pack(side="left", padx=5)
         ttk.Button(folder_frame, text="选择文件夹", command=self.select_folder).pack(side="left")
+
+        # 结果保存文件夹
+        output_frame = ttk.LabelFrame(self.root, text="选择结果保存文件夹", padding=10)
+        output_frame.pack(fill="x", padx=10, pady=5)
+
+        self.output_path = tk.StringVar(value=self.config.get("output_folder", ""))
+        ttk.Entry(output_frame, textvariable=self.output_path, width=50).pack(side="left", padx=5)
+        ttk.Button(output_frame, text="选择文件夹", command=self.select_output_folder).pack(side="left")
 
         # 控制按钮区域
         button_frame = ttk.Frame(self.root)
@@ -395,6 +716,13 @@ class OCRGUI:
             self.folder_path.set(folder)
             self.log_message(f"已选择文件夹: {folder}")
 
+    def select_output_folder(self):
+        initial_dir = self.output_path.get() or self.folder_path.get() or os.getcwd()
+        folder = filedialog.askdirectory(initialdir=initial_dir)
+        if folder:
+            self.output_path.set(folder)
+            self.log_message(f"已选择结果保存文件夹: {folder}")
+
     def log_message(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
@@ -407,6 +735,9 @@ class OCRGUI:
             return
         if not os.path.exists(self.folder_path.get()):
             self.log_message(f"文件夹不存在: {self.folder_path.get()}")
+            return
+        if self.output_path.get() and not os.path.exists(self.output_path.get()):
+            self.log_message(f"结果保存文件夹不存在: {self.output_path.get()}")
             return
 
         self.is_running = True
@@ -435,8 +766,10 @@ class OCRGUI:
                 return
 
             img_folder = self.folder_path.get()
-            image_files = [f for f in os.listdir(img_folder)
-                           if f.endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
+            output_folder = get_output_folder(self.output_path.get())
+            self.log_message(f"结果将保存到: {output_folder}")
+            image_files = sorted([f for f in os.listdir(img_folder)
+                                  if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))])
 
             if not image_files:
                 self.log_message("未找到图片文件！")
@@ -445,6 +778,7 @@ class OCRGUI:
 
             self.log_message(f"找到 {len(image_files)} 个图片文件")
             results = {}
+            processed_files = []
             total_files = len(image_files)
 
             for i, image_file in enumerate(image_files):
@@ -459,38 +793,60 @@ class OCRGUI:
 
                 try:
                     result_info = ocr_image_with_stats(image_path, self.ocr, use_preprocessing=True)
-                    numbers = result_info["result"]
-                    results[image_file] = numbers
+                    numbers = get_result_value(result_info)
+                    results[image_file] = result_info
+                    processed_files.append(image_file)
 
                     self.stats["total_images"] += 1
                     if numbers != "0":
                         self.stats["successful_recognitions"] += 1
 
-                    self.log_message(f"识别结果: {numbers}")
+                    status = get_result_status(result_info)
+                    if status == OCR_STATUS_RETRY:
+                        self.log_message(f"识别结果: {numbers} ({status})")
+                    else:
+                        self.log_message(f"识别结果: {numbers}")
                 except Exception as e:
                     self.log_message(f"处理失败: {str(e)}")
-                    results[image_file] = "0"
+                    results[image_file] = make_result("0", best_method="exception", status=OCR_STATUS_FAILED, note=str(e))
+                    processed_files.append(image_file)
                     self.stats["total_images"] += 1
 
                 self.progress_var.set(((i + 1) / total_files) * 100)
 
             if self.is_running and results:
-                txt_filename = save_results_to_txt(results)
+                filled_count = apply_interpolation_fill(results, processed_files)
+                if filled_count:
+                    self.log_message(f"已补值 {filled_count} 张失败图片，Excel 中标记为“{OCR_STATUS_FILLED}”")
+
+                result_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+
+                txt_filename = save_results_to_txt(results, output_folder, result_timestamp)
                 self.log_message(f"已保存 TXT: {txt_filename}")
 
-                xls_filename = save_results_to_excel(results)
+                xls_filename = save_results_to_excel(results, output_folder, result_timestamp)
                 if xls_filename:
                     self.log_message(f"已保存 Excel: {xls_filename}")
+
+                chart_filename = save_results_chart(results, output_folder, result_timestamp)
+                if chart_filename:
+                    self.log_message(f"已保存趋势图: {chart_filename}")
+                else:
+                    self.log_message("趋势图未生成：没有可绘制的有效数值")
 
                 self.log_message("所有结果保存完成！")
 
                 total_images = len(results)
-                successful_recognitions = sum(1 for numbers in results.values() if numbers != "0")
+                successful_recognitions = sum(1 for info in results.values() if get_result_value(info) != "0")
+                retry_count = sum(1 for info in results.values() if get_result_status(info) == OCR_STATUS_RETRY)
+                filled_count = sum(1 for info in results.values() if get_result_status(info) == OCR_STATUS_FILLED)
                 success_rate = (successful_recognitions / total_images * 100) if total_images > 0 else 0
                 self.log_message(
-                    f"识别统计: 共处理 {total_images} 张图片，成功识别 {successful_recognitions} 张，成功率 {success_rate:.1f}%")
+                    f"识别统计: 共处理 {total_images} 张图片，有效结果 {successful_recognitions} 张，"
+                    f"二次识别 {retry_count} 张，补值 {filled_count} 张，最终有效率 {success_rate:.1f}%")
 
                 self.config["last_folder"] = img_folder
+                self.config["output_folder"] = output_folder
                 save_config(self.config)
 
             self.progress_label.config(text="处理完成")
