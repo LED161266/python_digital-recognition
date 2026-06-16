@@ -7,6 +7,7 @@ import threading
 import time
 import os
 import json
+import csv
 import subprocess
 from PIL import Image
 import tempfile
@@ -29,6 +30,8 @@ except ImportError:
 
 
 OCR_MODE = "gemini"
+DEFAULT_TEST_FOLDER = r"C:\Users\李墨\Desktop\test\6"
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 PRESSURE_MIN_MPA = 0.0
 PRESSURE_MAX_MPA = 10.0
 GEMINI_DIGIT_CROP_REGIONS = [
@@ -711,12 +714,16 @@ class PhotoCaptureApp:
         self.save_path = os.getcwd()  # 默认当前目录
         self.text_save_path = os.getcwd()  # 文本保存路径
         self.capture_thread = None
+        self.is_folder_recognizing = False
+        self.stop_folder_requested = False
+        self.folder_thread = None
 
         # OCR设置
         self.enable_ocr = tk.BooleanVar(value=True)
         self.ocr_mode = OCR_MODE
         self.gemini_ocr_processor = None
         self.paddle_ocr_processor = None
+        self.ocr_lock = threading.Lock()
 
         # 图表相关数据（新增）
         self.chart_data = {
@@ -922,6 +929,24 @@ class PhotoCaptureApp:
                                   state=tk.DISABLED, height=2)
         self.stop_btn.pack(fill=tk.X)
 
+        self.folder_btn = tk.Button(button_frame, text="选择文件夹识别",
+                                    command=self.select_folder_and_recognize, height=2)
+        self.folder_btn.pack(fill=tk.X, pady=(8, 5))
+
+        self.stop_folder_btn = tk.Button(button_frame, text="停止文件夹识别",
+                                         command=self.stop_folder_recognition,
+                                         state=tk.DISABLED, height=2)
+        self.stop_folder_btn.pack(fill=tk.X)
+
+        result_frame = tk.LabelFrame(right_frame, text="OCR识别结果")
+        result_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        self.result_text = tk.Text(result_frame, height=10, wrap=tk.WORD)
+        result_scroll = tk.Scrollbar(result_frame, command=self.result_text.yview)
+        self.result_text.configure(yscrollcommand=result_scroll.set)
+        self.result_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        result_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
         # 状态栏
         self.status_var = tk.StringVar(value="就绪")
         status_bar = tk.Label(self.root, textvariable=self.status_var, bd=1,
@@ -989,6 +1014,13 @@ class PhotoCaptureApp:
             return {"text": f"OCR处理错误: {str(e)}", "numeric_values": []}
 
     def extract_digits_from_image(self, image_path):
+        lock = getattr(self, "ocr_lock", None)
+        if lock:
+            with lock:
+                return self._extract_digits_from_image_unlocked(image_path)
+        return self._extract_digits_from_image_unlocked(image_path)
+
+    def _extract_digits_from_image_unlocked(self, image_path):
         """Prefer the 2_Gemini_2.py OCR strategy and fallback to the old PaddleOCR path."""
         if not self.enable_ocr.get():
             return {"text": "OCR功能未启用", "numeric_values": [], "pressure_value": None}
@@ -1143,6 +1175,212 @@ class PhotoCaptureApp:
         # 更新画布
         self.chart_canvas.draw()
 
+    def select_folder_and_recognize(self):
+        if self.is_folder_recognizing:
+            messagebox.showinfo("提示", "文件夹识别正在进行中")
+            return
+        if not self.enable_ocr.get():
+            messagebox.showwarning("OCR不可用", "OCR功能未启用，无法进行文件夹识别")
+            return
+
+        initial_dir = DEFAULT_TEST_FOLDER if os.path.isdir(DEFAULT_TEST_FOLDER) else os.getcwd()
+        folder_path = filedialog.askdirectory(
+            initialdir=initial_dir,
+            title="选择包含图片的文件夹"
+        )
+        if not folder_path:
+            return
+
+        self.is_folder_recognizing = True
+        self.stop_folder_requested = False
+        self.folder_btn.config(state=tk.DISABLED)
+        self.stop_folder_btn.config(state=tk.NORMAL)
+        self.append_ocr_result_to_gui({
+            "image_name": "folder",
+            "image_path": folder_path,
+            "raw_text": "开始文件夹识别",
+            "mpa_value": "",
+            "engine": "",
+            "success": True,
+            "error": "",
+        })
+        self.set_status(f"开始识别文件夹: {folder_path}")
+
+        self.folder_thread = threading.Thread(
+            target=self.recognize_folder_images,
+            args=(folder_path,),
+            daemon=True
+        )
+        self.folder_thread.start()
+
+    def stop_folder_recognition(self):
+        if self.is_folder_recognizing:
+            self.stop_folder_requested = True
+            self.set_status("正在停止文件夹识别...")
+
+    def recognize_folder_images(self, folder_path):
+        results = []
+        stopped = False
+        try:
+            image_files = self._list_folder_images(folder_path)
+            total = len(image_files)
+            if total == 0:
+                self.root.after(0, self._finish_folder_recognition, 0, "", False, "文件夹中没有支持的图片文件")
+                return
+
+            for index, image_path in enumerate(image_files, start=1):
+                if self.stop_folder_requested:
+                    stopped = True
+                    break
+
+                image_name = os.path.basename(image_path)
+                self.set_status(f"正在识别 {index}/{total}: {image_name}")
+                result = self.recognize_single_image(image_path)
+                result["index"] = index
+                result["total"] = total
+                results.append(result)
+                self.append_ocr_result_to_gui(result)
+                if result.get("success") and result.get("mpa_value") is not None:
+                    self.update_trend_from_value(result["mpa_value"])
+
+            result_file = self.save_folder_ocr_results(results, folder_path) if results else ""
+            message = "文件夹识别已停止" if stopped else "文件夹识别完成"
+            self.root.after(0, self._finish_folder_recognition, len(results), result_file, stopped, message)
+        except Exception as e:
+            self.root.after(0, self._finish_folder_recognition, len(results), "", stopped, f"文件夹识别失败: {str(e)}")
+
+    def _list_folder_images(self, folder_path):
+        if not os.path.isdir(folder_path):
+            return []
+
+        image_files = []
+        for root_dir, _, filenames in os.walk(folder_path):
+            for filename in filenames:
+                ext = os.path.splitext(filename)[1].lower()
+                if ext in IMAGE_EXTENSIONS:
+                    image_files.append(os.path.join(root_dir, filename))
+        return sorted(image_files, key=lambda path: os.path.basename(path).lower())
+
+    def recognize_single_image(self, image_path):
+        image_name = os.path.basename(image_path)
+        try:
+            ocr_result = self.extract_digits_from_image(image_path)
+            raw_text = ocr_result.get("raw_text") or ocr_result.get("text", "")
+            mpa_value = ocr_result.get("pressure_value")
+            numeric_values = ocr_result.get("numeric_values", [])
+            if mpa_value is None and numeric_values:
+                try:
+                    mpa_value = float(numeric_values[0])
+                except (TypeError, ValueError):
+                    mpa_value = None
+
+            engine = self._format_engine_name(ocr_result.get("engine", ""))
+            error = ocr_result.get("error", "")
+            success = mpa_value is not None
+            if not success and not error:
+                error = "未识别到有效MPa读数"
+
+            return {
+                "image_name": image_name,
+                "image_path": image_path,
+                "raw_text": raw_text,
+                "mpa_value": mpa_value,
+                "engine": engine,
+                "success": success,
+                "error": error,
+                "best_method": ocr_result.get("best_method", ""),
+                "display_text": ocr_result.get("text", ""),
+            }
+        except Exception as e:
+            return {
+                "image_name": image_name,
+                "image_path": image_path,
+                "raw_text": "",
+                "mpa_value": None,
+                "engine": "",
+                "success": False,
+                "error": str(e),
+                "best_method": "",
+                "display_text": "",
+            }
+
+    def save_folder_ocr_results(self, results, folder_path):
+        output_path = os.path.join(folder_path, "folder_ocr_results.csv")
+        fieldnames = [
+            "image_name",
+            "image_path",
+            "raw_text",
+            "mpa_value",
+            "engine",
+            "success",
+            "error",
+            "best_method",
+        ]
+        with open(output_path, "w", newline="", encoding="utf-8-sig") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            writer.writeheader()
+            for result in results:
+                writer.writerow({key: result.get(key, "") for key in fieldnames})
+        return output_path
+
+    def append_ocr_result_to_gui(self, result):
+        if threading.current_thread() is threading.main_thread():
+            self._append_ocr_result_to_gui_now(result)
+        else:
+            self.root.after(0, self._append_ocr_result_to_gui_now, result)
+
+    def _append_ocr_result_to_gui_now(self, result):
+        if not hasattr(self, "result_text"):
+            return
+        status = "成功" if result.get("success") else "失败"
+        mpa_value = result.get("mpa_value")
+        try:
+            mpa_text = "" if mpa_value in (None, "") else format_pressure_value(float(mpa_value))
+        except (TypeError, ValueError):
+            mpa_text = str(mpa_value)
+        line = (
+            f"[{status}] {result.get('image_name', '')} "
+            f"MPa={mpa_text} 引擎={result.get('engine', '')} "
+            f"文本={result.get('raw_text', '')}"
+        )
+        if result.get("error"):
+            line += f" 错误={result.get('error')}"
+        self.result_text.insert(tk.END, line + "\n")
+        self.result_text.see(tk.END)
+
+    def update_trend_from_value(self, value):
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            return
+        self.update_chart(time.strftime("%Y%m%d_%H%M%S"), [numeric_value])
+
+    def _finish_folder_recognition(self, count, result_file, stopped, message):
+        self.is_folder_recognizing = False
+        self.stop_folder_requested = False
+        self.folder_btn.config(state=tk.NORMAL)
+        self.stop_folder_btn.config(state=tk.DISABLED)
+        status_text = f"{message}，已处理 {count} 张图片"
+        if result_file:
+            status_text += f"，结果: {result_file}"
+        self.set_status(status_text)
+        self.append_ocr_result_to_gui({
+            "image_name": "folder",
+            "image_path": result_file,
+            "raw_text": status_text,
+            "mpa_value": "",
+            "engine": "",
+            "success": not stopped,
+            "error": "",
+        })
+
+    def _format_engine_name(self, engine):
+        if engine == "gemini":
+            return "Gemini"
+        if engine == "paddle_fallback":
+            return "PaddleOCR"
+        return engine or ""
+
     def set_status(self, text):
         if threading.current_thread() is threading.main_thread():
             self.status_var.set(text)
@@ -1180,6 +1418,17 @@ class PhotoCaptureApp:
                     if numeric_values:
                         # 在主线程中更新图表
                         self.update_chart(timestamp, numeric_values)
+
+                    self.append_ocr_result_to_gui({
+                        "image_name": filename,
+                        "image_path": filepath,
+                        "raw_text": ocr_result.get("raw_text") or ocr_result_text,
+                        "mpa_value": ocr_result.get("pressure_value"),
+                        "engine": self._format_engine_name(ocr_result.get("engine", "")),
+                        "success": bool(numeric_values),
+                        "error": ocr_result.get("error", ""),
+                        "best_method": ocr_result.get("best_method", ""),
+                    })
 
                 # 更新状态
                 status_text = f"已拍摄 {photo_count} 张照片，最后保存: {filename}"
@@ -1254,6 +1503,7 @@ def main():
 
     def on_closing():
         app.is_capturing = False
+        app.stop_folder_requested = True
         if hasattr(app, 'cap'):
             app.cap.release()
         root.destroy()
