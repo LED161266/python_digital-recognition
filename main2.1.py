@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import ImageTk
 import cv2
+import numpy as np
 import threading
 import time
 import os
@@ -16,6 +17,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.dates as mdates
 from datetime import datetime
 
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 # 尝试导入PaddleOCR，如无法导入则设置标志
 try:
     from paddleocr import PaddleOCR
@@ -23,6 +26,134 @@ try:
     PADDLE_OCR_AVAILABLE = True
 except ImportError:
     PADDLE_OCR_AVAILABLE = False
+
+
+OCR_MODE = "gemini"
+PRESSURE_MIN_MPA = 0.0
+PRESSURE_MAX_MPA = 10.0
+GEMINI_DIGIT_CROP_REGIONS = [
+    ("digit_wide", (0.20, 0.20, 0.95, 0.72)),
+    ("digit_middle", (0.25, 0.22, 0.95, 0.65)),
+    ("digit_tight", (0.30, 0.25, 0.92, 0.60)),
+]
+GEMINI_RETRY_PREPROCESS_METHODS = [
+    "original",
+    "enhanced",
+    "lcd_sharp",
+    "lcd_binary",
+    "lcd_dark",
+]
+
+
+def read_image_cv2(image_path):
+    """Read image paths with non-ASCII characters on Windows."""
+    try:
+        return cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+    except Exception:
+        return cv2.imread(image_path)
+
+
+def format_pressure_value(value):
+    return f"{value:.3f}".rstrip("0").rstrip(".")
+
+
+def normalize_pressure_number(raw_number):
+    """Normalize OCR text such as 3695, 4MPa, or 4.50 MPa into an MPa float."""
+    if raw_number is None:
+        return None
+
+    text = str(raw_number).strip()
+    if not text:
+        return None
+
+    text = re.sub(r"(?i)\s*m\s*p\s*a", "", text)
+    text = re.sub(r"[,;:_oO]", ".", text)
+    text = text.replace(" ", "")
+    text = re.sub(r"[^0-9.]", "", text)
+    if not text:
+        return None
+
+    candidates = []
+    if "." in text:
+        parts = text.split(".")
+        int_part = parts[0] or "0"
+        dec_part = "".join(parts[1:])
+        if dec_part:
+            candidates.append(f"{int_part}.{dec_part}")
+            if len(int_part) > 1:
+                candidates.append(f"{int_part[-1]}.{dec_part}")
+    else:
+        digits = re.sub(r"\D", "", text)
+        if not digits:
+            return None
+        if len(digits) >= 4:
+            candidates.append(f"{digits[0]}.{digits[1:]}")
+            candidates.append(f"{digits[-4]}.{digits[-3:]}")
+        elif len(digits) == 3:
+            candidates.append(f"{digits[0]}.{digits[1:]}")
+        elif len(digits) == 2:
+            candidates.append(f"{digits[0]}.{digits[1]}")
+        else:
+            candidates.append(digits)
+
+    for candidate in candidates:
+        try:
+            value = float(candidate)
+        except ValueError:
+            continue
+        if PRESSURE_MIN_MPA <= value <= PRESSURE_MAX_MPA:
+            return value
+    return None
+
+
+def extract_mpa_candidates(text, base_score=0.0):
+    """Extract and score pressure candidates from OCR text."""
+    if not text:
+        return []
+
+    normalized_text = re.sub(r"[,;:_oO]", ".", str(text))
+    candidates = []
+    for match in re.finditer(r"\d+\.\d+|\.\d+|\d+", normalized_text):
+        raw = match.group(0)
+        value = normalize_pressure_number(raw)
+        if value is None:
+            continue
+
+        window_start = max(0, match.start() - 8)
+        window_end = min(len(normalized_text), match.end() + 8)
+        context = normalized_text[window_start:window_end]
+        has_mpa = re.search(r"(?i)m\s*p\s*a", context) is not None
+
+        score = float(base_score or 0.0)
+        score += 40 if has_mpa else 0
+        score += 20 if "." in raw else 0
+        score += 12 if raw.isdigit() and len(raw) in (3, 4) else 0
+        score += 10 if 3.0 <= value <= 5.0 else 0
+        score += max(0, 6 - abs(value - 4.0))
+        candidates.append({
+            "raw": raw,
+            "value": value,
+            "text": format_pressure_value(value),
+            "has_mpa": has_mpa,
+            "score": score,
+            "context": context,
+        })
+    return candidates
+
+
+def choose_best_pressure_value(candidates):
+    valid = [
+        candidate for candidate in candidates
+        if PRESSURE_MIN_MPA <= candidate.get("value", -1) <= PRESSURE_MAX_MPA
+    ]
+    if not valid:
+        return None
+    return max(valid, key=lambda item: item.get("score", 0.0))
+
+
+def extract_mpa_value(text, base_score=0.0):
+    candidates = extract_mpa_candidates(text, base_score=base_score)
+    return choose_best_pressure_value(candidates), candidates
 
 
 class PaddleOcrJson:
@@ -118,6 +249,304 @@ class PaddleOcrJson:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """退出上下文时自动关闭引擎"""
         self.close()
+
+
+class GeminiOCRProcessor:
+    """Reusable OCR adapter based on the recognition strategy from 2_Gemini_2.py."""
+
+    def __init__(self, lang='en', confidence_threshold=0.5):
+        self.confidence_threshold = confidence_threshold
+        self.initialized = False
+        self.ocr = None
+        self.init_error = ""
+
+        if not PADDLE_OCR_AVAILABLE:
+            self.init_error = "PaddleOCR模块不可用"
+            return
+
+        self.ocr = self._create_paddle_ocr(lang)
+        self.initialized = self.ocr is not None
+
+    def _create_paddle_ocr(self, lang):
+        use_gpu = os.getenv("PADDLEOCR_USE_GPU", "0").strip().lower() in ("1", "true", "yes", "on")
+        tuned_kwargs = {
+            "use_angle_cls": False,
+            "lang": lang,
+            "det_db_thresh": 0.05,
+            "det_db_box_thresh": 0.2,
+            "det_db_unclip_ratio": 1.9,
+            "rec_image_shape": "3, 48, 636",
+        }
+        if use_gpu:
+            tuned_kwargs.update({"use_gpu": True, "gpu_mem": 1000})
+
+        configs = [
+            tuned_kwargs,
+            {key: value for key, value in tuned_kwargs.items() if key not in ("use_gpu", "gpu_mem")},
+            {"use_textline_orientation": False, "lang": lang},
+            {"lang": lang},
+        ]
+
+        last_error = ""
+        for kwargs in configs:
+            try:
+                return PaddleOCR(**kwargs)
+            except Exception as exc:
+                last_error = str(exc)
+        self.init_error = f"Gemini OCR初始化失败: {last_error}"
+        return None
+
+    def set_confidence_threshold(self, threshold):
+        self.confidence_threshold = threshold
+
+    def recognize_image(self, image_path):
+        if not self.initialized:
+            return self._error_result(self.init_error or "Gemini OCR未初始化")
+
+        original_img = read_image_cv2(image_path)
+        if original_img is None:
+            return self._error_result("图片读取失败")
+
+        methods_to_try = ["original", "thicken_lines", "binary", "invert", "enhanced"]
+        best = self._recognize_with_methods(original_img, methods_to_try)
+        if best:
+            return self._success_result(best, "direct")
+
+        retry_candidates = []
+        for region_name, region in GEMINI_DIGIT_CROP_REGIONS:
+            cropped_img = self._crop_image_region(original_img, region)
+            retry_best = self._recognize_with_methods(
+                cropped_img,
+                GEMINI_RETRY_PREPROCESS_METHODS,
+                method_prefix=region_name,
+            )
+            if retry_best:
+                retry_candidates.append(retry_best)
+
+        if retry_candidates:
+            retry_candidates.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+            return self._success_result(retry_candidates[0], "retry")
+
+        return self._error_result("Gemini OCR未识别到0-10 MPa读数")
+
+    def extract_digits_from_image(self, image_path):
+        return self.recognize_image(image_path)
+
+    def _recognize_with_methods(self, img_array, methods, method_prefix=""):
+        candidates = []
+        for method in methods:
+            try:
+                if method == "original":
+                    processed_img = img_array
+                else:
+                    processed_img = self._preprocess_image_memory(img_array, method)
+                if processed_img is None:
+                    continue
+
+                raw_text, confidence = self._ocr_execute_memory(processed_img)
+                if not raw_text:
+                    continue
+
+                best_value, value_candidates = extract_mpa_value(raw_text, base_score=confidence * 100)
+                if not best_value:
+                    continue
+
+                method_name = f"{method_prefix}+{method}" if method_prefix else method
+                candidates.append({
+                    "method": method_name,
+                    "raw_text": raw_text,
+                    "confidence": confidence,
+                    "pressure": best_value,
+                    "candidates": value_candidates,
+                    "score": best_value.get("score", 0.0),
+                })
+            except Exception:
+                continue
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+        return candidates[0]
+
+    def _ocr_execute_memory(self, img_array):
+        try:
+            result = None
+            ocr_error = None
+            if hasattr(self.ocr, "ocr"):
+                try:
+                    result = self.ocr.ocr(img_array, cls=False)
+                except TypeError:
+                    try:
+                        result = self.ocr.ocr(img_array)
+                    except Exception as exc:
+                        ocr_error = exc
+                except Exception as exc:
+                    ocr_error = exc
+            if result is None and hasattr(self.ocr, "predict"):
+                temp_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                        temp_path = tmp.name
+                    cv2.imwrite(temp_path, img_array)
+                    result = self.ocr.predict(temp_path)
+                finally:
+                    if temp_path and os.path.exists(temp_path):
+                        os.unlink(temp_path)
+            if result is None and ocr_error:
+                raise ocr_error
+
+            texts, scores = self._collect_texts_scores(result)
+            if not texts:
+                return "", 0.0
+
+            combined_text = " ".join(texts)
+            avg_score = sum(scores) / len(scores) if scores else 0.0
+            return combined_text, avg_score
+        except Exception:
+            return "", 0.0
+
+    def _collect_texts_scores(self, result):
+        texts = []
+        scores = []
+
+        def add_text(text, score=0.0):
+            if text is None:
+                return
+            text = str(text).strip()
+            if not text:
+                return
+            texts.append(text)
+            try:
+                scores.append(float(score))
+            except (TypeError, ValueError):
+                scores.append(0.0)
+
+        def walk(node):
+            if isinstance(node, dict):
+                rec_texts = node.get("rec_texts") or node.get("texts") or []
+                rec_scores = node.get("rec_scores") or node.get("scores") or []
+                for index, text in enumerate(rec_texts):
+                    score = rec_scores[index] if index < len(rec_scores) else 0.0
+                    add_text(text, score)
+                return
+
+            if isinstance(node, (list, tuple)):
+                if len(node) >= 2 and isinstance(node[0], str) and isinstance(node[1], (int, float)):
+                    add_text(node[0], node[1])
+                    return
+                if (
+                    len(node) >= 2
+                    and isinstance(node[1], (list, tuple))
+                    and len(node[1]) >= 2
+                    and isinstance(node[1][0], str)
+                ):
+                    add_text(node[1][0], node[1][1])
+                    return
+                for child in node:
+                    walk(child)
+
+        walk(result)
+        return texts, scores
+
+    def _preprocess_image_memory(self, img_array, method="enhanced"):
+        if img_array is None:
+            return None
+
+        if len(img_array.shape) == 3:
+            gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img_array
+
+        height, width = gray.shape
+        target_size = 320
+        if height < target_size or width < target_size:
+            scale = max(target_size / height, target_size / width)
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            gray = cv2.resize(gray, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+
+        processed = gray
+        if method == "thicken_lines":
+            gray_inv = cv2.bitwise_not(gray) if np.mean(gray) > 127 else gray
+            kernel_v = np.ones((4, 1), np.uint8)
+            processed = cv2.dilate(gray_inv, kernel_v, iterations=1)
+            processed = cv2.bitwise_not(processed)
+        elif method == "binary":
+            processed = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 25, 2
+            )
+            processed = cv2.bitwise_not(processed)
+        elif method == "invert":
+            processed = cv2.bitwise_not(gray)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            processed = clahe.apply(processed)
+        elif method == "enhanced":
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            processed = clahe.apply(gray)
+        elif method == "lcd_sharp":
+            blur = cv2.GaussianBlur(gray, (0, 0), 1.0)
+            processed = cv2.addWeighted(gray, 1.8, blur, -0.8, 0)
+            clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+            processed = clahe.apply(processed)
+        elif method == "lcd_binary":
+            blur = cv2.GaussianBlur(gray, (3, 3), 0)
+            processed = cv2.adaptiveThreshold(
+                blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 31, 5
+            )
+        elif method == "lcd_dark":
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            boosted = clahe.apply(gray)
+            _, mask = cv2.threshold(boosted, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            kernel_v = np.ones((2, 1), np.uint8)
+            mask = cv2.dilate(mask, kernel_v, iterations=1)
+            processed = cv2.bitwise_not(mask)
+
+        return cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
+
+    def _crop_image_region(self, img_array, region):
+        height, width = img_array.shape[:2]
+        left, top, right, bottom = region
+        x1 = max(0, min(width - 1, int(width * left)))
+        y1 = max(0, min(height - 1, int(height * top)))
+        x2 = max(x1 + 1, min(width, int(width * right)))
+        y2 = max(y1 + 1, min(height, int(height * bottom)))
+        return img_array[y1:y2, x1:x2]
+
+    def _success_result(self, best, status):
+        pressure = best["pressure"]
+        pressure_text = pressure["text"]
+        return {
+            "text": pressure_text,
+            "raw_text": best.get("raw_text", ""),
+            "details": best.get("candidates", []),
+            "high_confidence_texts": [best.get("raw_text", "")],
+            "high_confidence_scores": [best.get("confidence", 0.0)],
+            "numeric_values": [pressure_text],
+            "pressure_value": pressure.get("value"),
+            "confidence": best.get("confidence", 0.0),
+            "engine": "gemini",
+            "status": status,
+            "best_method": best.get("method", ""),
+            "error": "",
+        }
+
+    def _error_result(self, message):
+        return {
+            "text": message,
+            "raw_text": "",
+            "details": [],
+            "high_confidence_texts": [],
+            "high_confidence_scores": [],
+            "numeric_values": [],
+            "pressure_value": None,
+            "confidence": 0.0,
+            "engine": "gemini",
+            "status": "failed",
+            "best_method": "",
+            "error": message,
+        }
 
 
 class PaddleOCRProcessor:
@@ -285,6 +714,8 @@ class PhotoCaptureApp:
 
         # OCR设置
         self.enable_ocr = tk.BooleanVar(value=True)
+        self.ocr_mode = OCR_MODE
+        self.gemini_ocr_processor = None
         self.paddle_ocr_processor = None
 
         # 图表相关数据（新增）
@@ -309,12 +740,25 @@ class PhotoCaptureApp:
         self.update_preview()
 
     def init_paddle_ocr(self):
-        """初始化PaddleOCR处理器"""
+        """初始化优先OCR处理器和PaddleOCR fallback"""
         if not PADDLE_OCR_AVAILABLE:
             messagebox.showwarning("PaddleOCR不可用",
                                    "PaddleOCR模块未安装，请运行 'pip install paddleocr' 安装\nOCR功能将不可用")
             self.enable_ocr.set(False)
             return
+
+        init_errors = []
+
+        try:
+            self.gemini_ocr_processor = GeminiOCRProcessor(
+                lang='en',
+                confidence_threshold=0.5
+            )
+            if not self.gemini_ocr_processor.initialized:
+                init_errors.append(self.gemini_ocr_processor.init_error or "Gemini OCR初始化失败")
+        except Exception as e:
+            self.gemini_ocr_processor = None
+            init_errors.append(f"Gemini OCR初始化失败: {str(e)}")
 
         try:
             self.paddle_ocr_processor = PaddleOCRProcessor(
@@ -325,13 +769,21 @@ class PhotoCaptureApp:
 
             # 检查处理器是否成功初始化
             if not hasattr(self.paddle_ocr_processor, 'initialized') or not self.paddle_ocr_processor.initialized:
-                self.enable_ocr.set(False)
-                messagebox.showwarning("PaddleOCR初始化失败",
-                                       "PaddleOCR初始化失败，OCR功能将不可用")
+                init_errors.append("PaddleOCR fallback初始化失败")
         except Exception as e:
-            messagebox.showwarning("PaddleOCR初始化警告",
-                                   f"PaddleOCR初始化失败: {str(e)}\nOCR功能将不可用")
+            self.paddle_ocr_processor = None
+            init_errors.append(f"PaddleOCR fallback初始化失败: {str(e)}")
+
+        gemini_ready = bool(self.gemini_ocr_processor and self.gemini_ocr_processor.initialized)
+        paddle_ready = bool(self.paddle_ocr_processor and getattr(self.paddle_ocr_processor, 'initialized', False))
+        if not gemini_ready and not paddle_ready:
             self.enable_ocr.set(False)
+            messagebox.showwarning("OCR初始化失败",
+                                   "Gemini OCR和PaddleOCR fallback均不可用，OCR功能将不可用")
+        elif not gemini_ready:
+            self.status_var.set("Gemini OCR不可用，已使用PaddleOCR fallback")
+        elif init_errors:
+            self.status_var.set("Gemini OCR已启用，PaddleOCR fallback不可用")
 
     def create_widgets(self):
         # 创建主框架
@@ -481,6 +933,8 @@ class PhotoCaptureApp:
 
     def update_confidence_threshold(self, value):
         """更新置信度阈值"""
+        if self.gemini_ocr_processor:
+            self.gemini_ocr_processor.set_confidence_threshold(float(value))
         if self.paddle_ocr_processor:
             self.paddle_ocr_processor.set_confidence_threshold(float(value))
 
@@ -520,7 +974,7 @@ class PhotoCaptureApp:
         # 每隔30毫秒更新一次预览
         self.root.after(30, self.update_preview)
 
-    def extract_digits_from_image(self, image_path):
+    def _extract_digits_from_image_legacy(self, image_path):
         """使用PaddleOCR从图像中提取数字（支持小数）"""
         if not self.enable_ocr.get() or not self.paddle_ocr_processor:
             return {"text": "OCR功能未启用", "numeric_values": []}
@@ -534,7 +988,81 @@ class PhotoCaptureApp:
         except Exception as e:
             return {"text": f"OCR处理错误: {str(e)}", "numeric_values": []}
 
-    def update_chart(self, timestamp_str, values):
+    def extract_digits_from_image(self, image_path):
+        """Prefer the 2_Gemini_2.py OCR strategy and fallback to the old PaddleOCR path."""
+        if not self.enable_ocr.get():
+            return {"text": "OCR功能未启用", "numeric_values": [], "pressure_value": None}
+
+        errors = []
+        if self.gemini_ocr_processor and self.gemini_ocr_processor.initialized:
+            try:
+                result = self.gemini_ocr_processor.recognize_image(image_path)
+                if isinstance(result, dict) and result.get("pressure_value") is not None:
+                    return result
+                if isinstance(result, dict) and result.get("error"):
+                    errors.append(result.get("error"))
+            except Exception as e:
+                errors.append(f"Gemini OCR失败: {str(e)}")
+
+        if self.paddle_ocr_processor and getattr(self.paddle_ocr_processor, 'initialized', False):
+            try:
+                result = self.paddle_ocr_processor.extract_digits_from_image(image_path)
+                if isinstance(result, dict):
+                    normalized = self._normalize_paddle_result(result)
+                    if normalized.get("pressure_value") is not None:
+                        if errors:
+                            normalized["text"] = f"{normalized['text']} (fallback)"
+                        return normalized
+                    errors.append(normalized.get("error") or "PaddleOCR fallback未识别到有效MPa读数")
+                else:
+                    errors.append("PaddleOCR fallback结果格式异常")
+            except Exception as e:
+                errors.append(f"PaddleOCR fallback失败: {str(e)}")
+
+        error_text = "OCR识别失败"
+        if errors:
+            error_text = f"{error_text}: {'; '.join(errors[:2])}"
+        return {
+            "text": error_text,
+            "numeric_values": [],
+            "pressure_value": None,
+            "engine": "none",
+            "error": error_text,
+        }
+
+    def _normalize_paddle_result(self, result):
+        raw_text = result.get("text", "")
+        source_text = " ".join(
+            [raw_text] + [str(item) for item in result.get("numeric_values", [])]
+        )
+        best_value, candidates = extract_mpa_value(source_text)
+        if not best_value:
+            return {
+                "text": raw_text or "PaddleOCR fallback未识别到有效MPa读数",
+                "raw_text": raw_text,
+                "details": result.get("details", []),
+                "numeric_values": [],
+                "pressure_value": None,
+                "confidence": 0.0,
+                "engine": "paddle_fallback",
+                "error": "PaddleOCR fallback未识别到有效MPa读数",
+            }
+
+        pressure_text = best_value["text"]
+        return {
+            "text": pressure_text,
+            "raw_text": raw_text,
+            "details": candidates or result.get("details", []),
+            "high_confidence_texts": result.get("high_confidence_texts", []),
+            "high_confidence_scores": result.get("high_confidence_scores", []),
+            "numeric_values": [pressure_text],
+            "pressure_value": best_value["value"],
+            "confidence": max(result.get("high_confidence_scores", [0.0]) or [0.0]),
+            "engine": "paddle_fallback",
+            "error": "",
+        }
+
+    def _update_chart_legacy(self, timestamp_str, values):
         """更新图表显示"""
         # 转换时间戳字符串为datetime对象
         try:
@@ -559,6 +1087,29 @@ class PhotoCaptureApp:
         if valid_values_added:
             # 在主线程中更新UI
             self.root.after(0, self._update_chart_ui)
+
+    def update_chart(self, timestamp_str, values):
+        """Schedule chart data updates on the Tkinter main thread."""
+        try:
+            timestamp = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
+        except ValueError:
+            timestamp = datetime.now()
+
+        parsed_values = []
+        for value_item in values:
+            try:
+                parsed_values.append(float(value_item))
+            except (TypeError, ValueError):
+                continue
+
+        if parsed_values:
+            self.root.after(0, self._append_chart_values, timestamp, parsed_values)
+
+    def _append_chart_values(self, timestamp, values):
+        for value in values:
+            self.chart_data['timestamps'].append(timestamp)
+            self.chart_data['values'].append(value)
+        self._update_chart_ui()
 
     def _update_chart_ui(self):
         """在主线程中更新图表UI"""
@@ -591,6 +1142,12 @@ class PhotoCaptureApp:
 
         # 更新画布
         self.chart_canvas.draw()
+
+    def set_status(self, text):
+        if threading.current_thread() is threading.main_thread():
+            self.status_var.set(text)
+        else:
+            self.root.after(0, self.status_var.set, text)
 
     def capture_photos(self):
         photo_count = 0
@@ -628,7 +1185,7 @@ class PhotoCaptureApp:
                 status_text = f"已拍摄 {photo_count} 张照片，最后保存: {filename}"
                 if ocr_result_text:
                     status_text += f", 识别结果: {ocr_result_text}"
-                self.status_var.set(status_text)
+                self.set_status(status_text)
 
             # 等待指定间隔
             for _ in range(int(self.capture_interval * 10)):
@@ -636,7 +1193,7 @@ class PhotoCaptureApp:
                     break
                 time.sleep(0.1)
 
-        self.status_var.set("拍照已停止")
+        self.set_status("拍照已停止")
 
     def start_capture(self):
         try:
@@ -679,7 +1236,7 @@ class PhotoCaptureApp:
         self.capture_thread.daemon = True
         self.capture_thread.start()
 
-        self.status_var.set("开始拍照...")
+        self.set_status("开始拍照...")
 
     def stop_capture(self):
         self.is_capturing = False
