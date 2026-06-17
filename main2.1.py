@@ -159,6 +159,16 @@ def extract_mpa_value(text, base_score=0.0):
     return choose_best_pressure_value(candidates), candidates
 
 
+def test_extract_mpa_value_cases():
+    """Small no-GUI smoke test for pressure parsing helpers."""
+    cases = ["3.695", "3695", "4Mpa", "4 MPa", "4.2MPa", "4.50 MPa"]
+    results = {}
+    for case in cases:
+        best, _ = extract_mpa_value(case)
+        results[case] = best["value"] if best else None
+    return results
+
+
 class PaddleOcrJson:
     """
     Python 调用 PaddleOCR-json 的示例类
@@ -706,7 +716,7 @@ class PhotoCaptureApp:
     def __init__(self, root):
         self.root = root
         self.root.title("自动拍照与数字识别系统")
-        self.root.geometry("1000x700")  # 稍微增大窗口以容纳图表
+        self.root.geometry("1250x860")  # 增大窗口，确保文件夹识别入口可见
 
         # 拍照控制变量
         self.is_capturing = False
@@ -748,12 +758,6 @@ class PhotoCaptureApp:
 
     def init_paddle_ocr(self):
         """初始化优先OCR处理器和PaddleOCR fallback"""
-        if not PADDLE_OCR_AVAILABLE:
-            messagebox.showwarning("PaddleOCR不可用",
-                                   "PaddleOCR模块未安装，请运行 'pip install paddleocr' 安装\nOCR功能将不可用")
-            self.enable_ocr.set(False)
-            return
-
         init_errors = []
 
         try:
@@ -785,12 +789,27 @@ class PhotoCaptureApp:
         paddle_ready = bool(self.paddle_ocr_processor and getattr(self.paddle_ocr_processor, 'initialized', False))
         if not gemini_ready and not paddle_ready:
             self.enable_ocr.set(False)
-            messagebox.showwarning("OCR初始化失败",
-                                   "Gemini OCR和PaddleOCR fallback均不可用，OCR功能将不可用")
+            self._log_ocr_startup_message("OCR不可用：Gemini OCR和PaddleOCR fallback均初始化失败")
         elif not gemini_ready:
-            self.status_var.set("Gemini OCR不可用，已使用PaddleOCR fallback")
+            self._log_ocr_startup_message("Gemini OCR不可用，已使用PaddleOCR fallback")
         elif init_errors:
-            self.status_var.set("Gemini OCR已启用，PaddleOCR fallback不可用")
+            self._log_ocr_startup_message("PaddleOCR 初始化失败，已禁用 PaddleOCR fallback，主识别逻辑继续使用 Gemini")
+        else:
+            self._log_ocr_startup_message("Gemini OCR已启用，PaddleOCR fallback可用")
+
+    def _log_ocr_startup_message(self, message):
+        self.set_status(message)
+        self.append_ocr_result_to_gui({
+            "filename": "OCR",
+            "image_name": "OCR",
+            "image_path": "",
+            "raw_text": message,
+            "text": message,
+            "mpa_value": "",
+            "engine": "",
+            "success": True,
+            "error": "",
+        })
 
     def create_widgets(self):
         # 创建主框架
@@ -834,7 +853,7 @@ class PhotoCaptureApp:
         self.chart_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         # 右侧控制区域
-        right_frame = tk.Frame(main_frame, width=250)
+        right_frame = tk.Frame(main_frame, width=320)
         right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
         right_frame.pack_propagate(False)
 
@@ -870,7 +889,7 @@ class PhotoCaptureApp:
         img_browse_btn.pack(side=tk.RIGHT)
 
         # OCR设置区域
-        ocr_frame = tk.LabelFrame(right_frame, text="PaddleOCR数字识别设置")
+        ocr_frame = tk.LabelFrame(right_frame, text="OCR数字识别设置（Gemini优先）")
         ocr_frame.pack(fill=tk.X, pady=(0, 10))
 
         # OCR启用复选框
@@ -929,9 +948,12 @@ class PhotoCaptureApp:
                                   state=tk.DISABLED, height=2)
         self.stop_btn.pack(fill=tk.X)
 
+        self.folder_progress_var = tk.StringVar(value="文件夹识别进度：0/0")
+        tk.Label(button_frame, textvariable=self.folder_progress_var, anchor=tk.W).pack(fill=tk.X, pady=(8, 2))
+
         self.folder_btn = tk.Button(button_frame, text="选择文件夹识别",
                                     command=self.select_folder_and_recognize, height=2)
-        self.folder_btn.pack(fill=tk.X, pady=(8, 5))
+        self.folder_btn.pack(fill=tk.X, pady=(0, 5))
 
         self.stop_folder_btn = tk.Button(button_frame, text="停止文件夹识别",
                                          command=self.stop_folder_recognition,
@@ -1204,6 +1226,7 @@ class PhotoCaptureApp:
             "success": True,
             "error": "",
         })
+        self.set_folder_progress("文件夹识别进度：0/0")
         self.set_status(f"开始识别文件夹: {folder_path}")
 
         self.folder_thread = threading.Thread(
@@ -1224,6 +1247,7 @@ class PhotoCaptureApp:
         try:
             image_files = self._list_folder_images(folder_path)
             total = len(image_files)
+            self.set_folder_progress(f"文件夹识别进度：0/{total}")
             if total == 0:
                 self.root.after(0, self._finish_folder_recognition, 0, "", False, "文件夹中没有支持的图片文件")
                 return
@@ -1234,6 +1258,7 @@ class PhotoCaptureApp:
                     break
 
                 image_name = os.path.basename(image_path)
+                self.set_folder_progress(f"正在识别 {index}/{total}")
                 self.set_status(f"正在识别 {index}/{total}: {image_name}")
                 result = self.recognize_single_image(image_path)
                 result["index"] = index
@@ -1281,8 +1306,10 @@ class PhotoCaptureApp:
                 error = "未识别到有效MPa读数"
 
             return {
+                "filename": image_name,
                 "image_name": image_name,
                 "image_path": image_path,
+                "text": raw_text,
                 "raw_text": raw_text,
                 "mpa_value": mpa_value,
                 "engine": engine,
@@ -1293,8 +1320,10 @@ class PhotoCaptureApp:
             }
         except Exception as e:
             return {
+                "filename": image_name,
                 "image_name": image_name,
                 "image_path": image_path,
+                "text": "",
                 "raw_text": "",
                 "mpa_value": None,
                 "engine": "",
@@ -1307,14 +1336,13 @@ class PhotoCaptureApp:
     def save_folder_ocr_results(self, results, folder_path):
         output_path = os.path.join(folder_path, "folder_ocr_results.csv")
         fieldnames = [
-            "image_name",
+            "filename",
             "image_path",
+            "engine",
             "raw_text",
             "mpa_value",
-            "engine",
             "success",
             "error",
-            "best_method",
         ]
         with open(output_path, "w", newline="", encoding="utf-8-sig") as csv_file:
             writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -1339,13 +1367,15 @@ class PhotoCaptureApp:
         except (TypeError, ValueError):
             mpa_text = str(mpa_value)
         line = (
-            f"[{status}] {result.get('image_name', '')} "
-            f"MPa={mpa_text} 引擎={result.get('engine', '')} "
-            f"文本={result.get('raw_text', '')}"
+            f"文件名：{result.get('filename') or result.get('image_name', '')}\n"
+            f"OCR引擎：{result.get('engine', '')}\n"
+            f"识别文本：{result.get('raw_text', '')}\n"
+            f"MPa数值：{mpa_text}\n"
+            f"状态：{status}"
         )
         if result.get("error"):
-            line += f" 错误={result.get('error')}"
-        self.result_text.insert(tk.END, line + "\n")
+            line += f"\n错误信息：{result.get('error')}"
+        self.result_text.insert(tk.END, line + "\n\n")
         self.result_text.see(tk.END)
 
     def update_trend_from_value(self, value):
@@ -1363,6 +1393,7 @@ class PhotoCaptureApp:
         status_text = f"{message}，已处理 {count} 张图片"
         if result_file:
             status_text += f"，结果: {result_file}"
+        self.set_folder_progress(f"文件夹识别进度：{count}/{count}")
         self.set_status(status_text)
         self.append_ocr_result_to_gui({
             "image_name": "folder",
@@ -1387,6 +1418,14 @@ class PhotoCaptureApp:
         else:
             self.root.after(0, self.status_var.set, text)
 
+    def set_folder_progress(self, text):
+        if not hasattr(self, "folder_progress_var"):
+            return
+        if threading.current_thread() is threading.main_thread():
+            self.folder_progress_var.set(text)
+        else:
+            self.root.after(0, self.folder_progress_var.set, text)
+
     def capture_photos(self):
         photo_count = 0
         while self.is_capturing:
@@ -1405,30 +1444,21 @@ class PhotoCaptureApp:
                 # 如果启用了OCR，识别数字
                 ocr_result_text = ""
                 if self.enable_ocr.get():
-                    ocr_result = self.extract_digits_from_image(filepath)
-                    ocr_result_text = ocr_result.get('text', '')
-                    numeric_values = ocr_result.get('numeric_values', [])
+                    single_result = self.recognize_single_image(filepath)
+                    ocr_result_text = single_result.get("raw_text") or single_result.get("text", "")
+                    mpa_value = single_result.get("mpa_value")
 
                     # 保存识别结果到文本文件
                     text_filepath = os.path.join(self.text_save_path, self.text_filename_var.get())
                     with open(text_filepath, "a", encoding="utf-8") as f:
-                        f.write(f"{timestamp} - {filename}: {ocr_result_text}\n")
+                        f.write(f"{timestamp} - {filename}: {ocr_result_text} | MPa={mpa_value}\n")
 
                     # 如果识别到有效数值，更新图表（功能2）
-                    if numeric_values:
+                    if mpa_value is not None:
                         # 在主线程中更新图表
-                        self.update_chart(timestamp, numeric_values)
+                        self.update_chart(timestamp, [mpa_value])
 
-                    self.append_ocr_result_to_gui({
-                        "image_name": filename,
-                        "image_path": filepath,
-                        "raw_text": ocr_result.get("raw_text") or ocr_result_text,
-                        "mpa_value": ocr_result.get("pressure_value"),
-                        "engine": self._format_engine_name(ocr_result.get("engine", "")),
-                        "success": bool(numeric_values),
-                        "error": ocr_result.get("error", ""),
-                        "best_method": ocr_result.get("best_method", ""),
-                    })
+                    self.append_ocr_result_to_gui(single_result)
 
                 # 更新状态
                 status_text = f"已拍摄 {photo_count} 张照片，最后保存: {filename}"
