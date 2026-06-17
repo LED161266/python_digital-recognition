@@ -1,11 +1,13 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import ImageTk
+import os
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import cv2
 import numpy as np
 import threading
 import time
-import os
 import json
 import csv
 import subprocess
@@ -17,8 +19,6 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.dates as mdates
 from datetime import datetime
-
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 # 尝试导入PaddleOCR，如无法导入则设置标志
 try:
@@ -268,23 +268,18 @@ class GeminiOCRProcessor:
     """Reusable OCR adapter based on the recognition strategy from 2_Gemini_2.py."""
 
     def __init__(self, lang='en', confidence_threshold=0.5):
+        self.lang = lang
         self.confidence_threshold = confidence_threshold
-        self.initialized = False
+        self.initialized = True
         self.ocr = None
         self.init_error = ""
-
-        if not PADDLE_OCR_AVAILABLE:
-            self.init_error = "PaddleOCR模块不可用"
-            return
-
-        self.ocr = self._create_paddle_ocr(lang)
-        self.initialized = self.ocr is not None
 
     def _create_paddle_ocr(self, lang):
         use_gpu = os.getenv("PADDLEOCR_USE_GPU", "0").strip().lower() in ("1", "true", "yes", "on")
         tuned_kwargs = {
             "use_angle_cls": False,
             "lang": lang,
+            "use_gpu": False,
             "det_db_thresh": 0.05,
             "det_db_box_thresh": 0.2,
             "det_db_unclip_ratio": 1.9,
@@ -313,8 +308,12 @@ class GeminiOCRProcessor:
         self.confidence_threshold = threshold
 
     def recognize_image(self, image_path):
-        if not self.initialized:
-            return self._error_result(self.init_error or "Gemini OCR未初始化")
+        if self.ocr is None:
+            if not PADDLE_OCR_AVAILABLE:
+                return self._error_result("PaddleOCR模块不可用，Gemini算法无法执行")
+            self.ocr = self._create_paddle_ocr(self.lang)
+            if self.ocr is None:
+                return self._error_result(self.init_error or "Gemini OCR初始化失败")
 
         original_img = read_image_cv2(image_path)
         if original_img is None:
@@ -583,6 +582,7 @@ class PaddleOCRProcessor:
             self.ocr = PaddleOCR(
                 use_textline_orientation=use_textline_orientation,
                 lang=lang,
+                use_gpu=False,
                 # show_log=False  # 关闭详细日志输出
             )
             self.initialized = True
@@ -733,6 +733,7 @@ class PhotoCaptureApp:
         self.ocr_mode = OCR_MODE
         self.gemini_ocr_processor = None
         self.paddle_ocr_processor = None
+        self.paddle_init_attempted = False
         self.ocr_lock = threading.Lock()
 
         # 图表相关数据（新增）
@@ -758,6 +759,21 @@ class PhotoCaptureApp:
 
     def init_paddle_ocr(self):
         """初始化优先OCR处理器和PaddleOCR fallback"""
+        try:
+            self.gemini_ocr_processor = GeminiOCRProcessor(
+                lang='en',
+                confidence_threshold=0.5
+            )
+            self._log_ocr_startup_message("Gemini主识别逻辑已启用，PaddleOCR fallback 将按需初始化")
+        except Exception as e:
+            self.gemini_ocr_processor = None
+            if PADDLE_OCR_AVAILABLE:
+                self._log_ocr_startup_message(f"Gemini初始化失败，PaddleOCR fallback 将按需初始化: {str(e)}")
+            else:
+                self.enable_ocr.set(False)
+                self._log_ocr_startup_message("OCR不可用：Gemini初始化失败且PaddleOCR模块不可用")
+        return
+
         init_errors = []
 
         try:
@@ -1058,9 +1074,10 @@ class PhotoCaptureApp:
             except Exception as e:
                 errors.append(f"Gemini OCR失败: {str(e)}")
 
-        if self.paddle_ocr_processor and getattr(self.paddle_ocr_processor, 'initialized', False):
+        paddle_processor = self._get_paddle_fallback_processor()
+        if paddle_processor and getattr(paddle_processor, 'initialized', False):
             try:
-                result = self.paddle_ocr_processor.extract_digits_from_image(image_path)
+                result = paddle_processor.extract_digits_from_image(image_path)
                 if isinstance(result, dict):
                     normalized = self._normalize_paddle_result(result)
                     if normalized.get("pressure_value") is not None:
@@ -1083,6 +1100,27 @@ class PhotoCaptureApp:
             "engine": "none",
             "error": error_text,
         }
+
+    def _get_paddle_fallback_processor(self):
+        if self.paddle_ocr_processor is not None:
+            return self.paddle_ocr_processor
+        if self.paddle_init_attempted or not PADDLE_OCR_AVAILABLE:
+            return None
+        self.paddle_init_attempted = True
+        try:
+            self.paddle_ocr_processor = PaddleOCRProcessor(
+                use_textline_orientation=True,
+                lang='ch',
+                confidence_threshold=float(self.confidence_var.get())
+            )
+            if not getattr(self.paddle_ocr_processor, 'initialized', False):
+                self.set_status("PaddleOCR 初始化失败，已禁用 PaddleOCR fallback，主识别逻辑继续使用 Gemini")
+                return None
+            return self.paddle_ocr_processor
+        except Exception as e:
+            self.paddle_ocr_processor = None
+            self.set_status(f"PaddleOCR fallback 初始化失败，已跳过: {str(e)}")
+            return None
 
     def _normalize_paddle_result(self, result):
         raw_text = result.get("text", "")
